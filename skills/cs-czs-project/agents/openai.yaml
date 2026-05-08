@@ -1,0 +1,4 @@
+interface:
+  display_name: "CS:CZ Source Project"
+  short_description: "Project layout, asset pipeline, engine structure, and coding conventions for CS:CZ Source."
+  default_prompt: "Load the CS:CZ Source project context before working on any task in this repo."
