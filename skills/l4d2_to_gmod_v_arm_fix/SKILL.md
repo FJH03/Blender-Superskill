@@ -1,142 +1,266 @@
 ---
 name: l4d2-to-gmod-v-arm-fix
-description: 修复从 L4D2/GMod 来源移植到 CS:CZ 标准骨架的 viewmodel 手臂时，大拇指骨骼 rest pose 朝向错误导致游戏内拇指翻转的问题。使用此 skill 当从非标准来源导入手臂模型、拇指朝向异常、或需要对齐标准 v_arm_gign 骨架时。
+description: 修复从 L4D2/GMod 来源移植到 CS:CZ 的 viewmodel 手臂时，大拇指翻转及位置偏差。Pose Mode 只旋转拇指骨骼，保持位置和 Hand 不动，游戏内目视微调 Finger0 的 XZ 轴。
 ---
 
-# L4D2/GMod → CS:CZ Viewmodel 手臂拇指朝向修复
+# L4D2/GMod → CS:CZ Viewmodel 手臂拇指修复
 
-## 问题根因
+## 问题诊断
 
-从 L4D2 / GMod 等来源移植的手臂模型（`.smd`），其骨架 rest pose 中**大拇指骨骼 `Finger0` 的 X 轴旋转和 CS:CZ 标准骨架差了约 170°**。这导致游戏内播放动画时，拇指指甲朝向反方向（朝内而非朝外）。
+从 L4D2/GMod 移植到 CS:CZ 的 c_arm 模型，游戏内拇指翻转、位置不对。
 
-表面现象：
-- HLMV 里预览 `idle.smd` **看起来正常**（因为动画和骨架来自同一来源，自洽）
-- 游戏内**拇指翻转**（因为动画或其他骨骼操作按标准骨架的本地坐标系计算）
+**根因**：CS:CZ 引擎用 `EF_BONEMERGE` 把武器动画合并到手臂。武器动画假设标准 rest pose（`models/v_model/c_arm/standard/c_arms_cstrike_v2.smd`）。L4D2 模型的拇指 rest pose 与标准差了约 173°，bonemerge 后拇指朝向反了。
 
-本质原因：
-- SMD 文件的 `skeleton` 段定义了每根骨骼在 `time 0` 的世界空间旋转值（Euler XYZ）
-- Blender SMD 导入器会从世界空间数据反算正确的局部旋转，因此 Blender 视口里 rest pose 可能显示正确
-- 但 **studiomdl 编译器直接读取 SMD 文本里的 raw 旋转值**作为 rest pose
-- 如果 SMD 文件里的 raw 值和标准骨架不一致，编译出的 `.mdl` 就会有错误的骨骼朝向
+**为什么不能简单匹配标准值**：L4D2 模型的 Hand 骨骼旋转（~79°）与标准 CS:CZ（~90°）差约 11°。这导致即使拇指局部旋转匹配标准，世界空间中拇指朝向也不同。但 Hand 不能改——改了四个手指全歪。
 
-## 对比标准骨架
+## 修复策略
 
-CS:CZ 的标准 viewmodel 手臂在 `models/v_model/c_arm/standard/`：
-- 参考骨架：`c_arms_cstrike_v2.smd`（43 骨骼，根为 `ValveBiped.Bip01_Spine4`）
-- QC：`v_arm_gign.qc`
-- 动画：`v_arm_gign_anims/idle.smd`
+| 能不能 | 为什么 |
+|--------|--------|
+| ❌ 改 Hand 旋转 | 四指跟着变，整体手部变形，不可接受 |
+| ❌ 改骨骼位置 | 顶点蒙皮撕裂，mesh 破损 |
+| ✅ 只旋转拇指骨骼 | 通过 Apply Pose as Rest Pose，骨骼和顶点同步变换，mesh 完整 |
+| ✅ Finger0 X/Z 微调 | 补偿 Hand 旋转差异，游戏内目视确认 |
 
-关键拇指骨骼标准 rest pose（SMD skeleton time 0 的旋转值，弧度）：
+## 核心原则
 
-| 骨骼 | 标准旋转 (rx, ry, rz) rad |
-|------|--------------------------|
-| `ValveBiped.Bip01_L_Finger0` | `-1.223, -0.679, -0.789` |
-| `ValveBiped.Bip01_L_Finger01` | `0, 0, 0.229` |
-| `ValveBiped.Bip01_L_Finger02` | `0, 0, 0.363` |
-| `ValveBiped.Bip01_R_Finger0` | `1.221, 0.674, -0.794` |
-| `ValveBiped.Bip01_R_Finger01` | `0, 0, 0.229` |
-| `ValveBiped.Bip01_R_Finger02` | `0, 0, 0.363` |
+- **不改 Hand**：会破坏其他四指
+- **不改骨骼位置**：会撕裂 mesh
+- **只旋转拇指骨骼**（共 6 根，左右各 3 根）：
+  - `ValveBiped.Bip01_L_Finger0` / `ValveBiped.Bip01_R_Finger0`
+  - `ValveBiped.Bip01_L_Finger01` / `ValveBiped.Bip01_R_Finger01`
+  - `ValveBiped.Bip01_L_Finger02` / `ValveBiped.Bip01_R_Finger02`
+- **标准值只是起点**，Finger0 的 X/Z 必须在游戏内目视微调
 
-## 修复流程
+## 修复流程（完整可执行脚本）
 
-### 第一步：Blender 导入 + 验证
+以下是一份完整的 Blender Python 脚本，可直接在 MCP 中逐步执行。需要修改的路径用 `< >` 标记。
 
-1. 在 Blender 中清空场景
-2. 导入待修复的 `arms.smd`（参考骨架 + 网格）
-3. 进入 Edit Mode，检查 `Finger0` 骨骼相对 Hand 父骨骼的局部旋转是否匹配标准值
+### 步骤 1：导入原始模型 + 旋转拇指
+
+**目的**：在 Pose Mode 中把拇指骨骼旋转到接近标准值，然后 Apply Pose as Rest Pose 固化。mesh 顶点会自动跟随骨骼变换，不会撕裂。
+
+**注意**：脚本中的目标旋转值（`target` 字典）先用标准值。后续步骤 4 中如果拇指位置不对，改 Finger0 的 X 和 Z 值后重新执行此步骤。
 
 ```python
-# 检查局部旋转
-import bpy, math
-armature = bpy.data.objects['arms_skeleton']
+import bpy, math, os, shutil
+from mathutils import Euler, Matrix
+
+# === 清场景 ===
+for obj in list(bpy.data.objects): bpy.data.objects.remove(obj)
+for m in list(bpy.data.meshes): bpy.data.meshes.remove(m)
+for a in list(bpy.data.armatures): bpy.data.armatures.remove(a)
+
+# === 导入原始模型 ===
+bpy.ops.import_scene.smd(filepath=r"<你的arms.smd路径>")
+for obj in list(bpy.data.objects):
+    if 'smd_bone_vis' in obj.name.lower():
+        bpy.data.objects.remove(obj)
+
+arm = [o for o in bpy.data.objects if o.type == 'ARMATURE'][0]
+mesh = [o for o in bpy.data.objects if o.type == 'MESH'][0]
+print(f"Armature: {arm.name}, Mesh: {mesh.name}")
+
+# === 读取当前 rest pose 局部矩阵 ===
 bpy.ops.object.mode_set(mode='EDIT')
-for name in ['ValveBiped.Bip01_L_Finger0', 'ValveBiped.Bip01_R_Finger0']:
-    bone = armature.data.edit_bones[name]
-    parent = armature.data.edit_bones[bone.parent.name]
-    parent_mat = armature.matrix_world @ parent.matrix
-    bone_mat = armature.matrix_world @ bone.matrix
-    local = parent_mat.inverted() @ bone_mat
-    e = local.decompose()[1].to_euler()
-    print(f"{name}: ({math.degrees(e.x):.1f}, {math.degrees(e.y):.1f}, {math.degrees(e.z):.1f})")
+
+thumb_bones = [
+    'ValveBiped.Bip01_L_Finger0',  'ValveBiped.Bip01_R_Finger0',
+    'ValveBiped.Bip01_L_Finger01', 'ValveBiped.Bip01_R_Finger01',
+    'ValveBiped.Bip01_L_Finger02', 'ValveBiped.Bip01_R_Finger02',
+]
+
+current = {}
+for name in thumb_bones:
+    bone = arm.data.edit_bones.get(name)
+    if bone and bone.parent:
+        p = arm.matrix_world @ bone.parent.matrix
+        b = arm.matrix_world @ bone.matrix
+        current[name] = (p.inverted() @ b).copy()
+bpy.ops.object.mode_set(mode='OBJECT')
+
+# === 目标旋转（标准值，Finger0 的 X/Z 后续游戏内微调） ===
+target = {
+    'ValveBiped.Bip01_L_Finger0':  Euler((-1.223, -0.679, -0.789), 'XYZ'),  # X=-70°,Y=-39°,Z=-45°
+    'ValveBiped.Bip01_R_Finger0':  Euler(( 1.221,  0.674, -0.794), 'XYZ'),  # X= 70°,Y= 39°,Z=-45°
+    'ValveBiped.Bip01_L_Finger01': Euler((0, 0, 0.229), 'XYZ'),              # Z= 13°
+    'ValveBiped.Bip01_R_Finger01': Euler((0, 0, 0.229), 'XYZ'),
+    'ValveBiped.Bip01_L_Finger02': Euler((0, 0, 0.363), 'XYZ'),              # Z= 21°
+    'ValveBiped.Bip01_R_Finger02': Euler((0, 0, 0.363), 'XYZ'),
+}
+
+# === Pose Mode: 只旋转，保持原位置 ===
+bpy.ops.object.mode_set(mode='POSE')
+for pb in arm.pose.bones:
+    pb.location = (0,0,0)
+    pb.rotation_mode = 'XYZ'
+    pb.rotation_euler = (0,0,0)
+    pb.scale = (1,1,1)
+
+for name, tgt_rot in target.items():
+    pb = arm.pose.bones.get(name)
+    if pb is None: continue
+    cur_loc = current[name].decompose()[0]  # 保持原始位置
+    tgt_mat = Matrix.Translation(cur_loc) @ tgt_rot.to_matrix().to_4x4()
+    pose_mat = current[name].inverted() @ tgt_mat
+    pose_loc, pose_rot, _ = pose_mat.decompose()
+    pb.location = pose_loc
+    pb.rotation_euler = pose_rot.to_euler('XYZ')
+
+# === Apply Pose as Rest Pose ===
+bpy.ops.pose.select_all(action='SELECT')
+bpy.ops.pose.armature_apply(selected=False)
+print("拇指旋转已应用。下一步导出。")
 ```
 
-目标值：L_Finger0 约 `(-70°, -39°, -45°)`，R_Finger0 约 `(70°, 39°, -45°)`
+### 步骤 2：导出 arms.smd + 更新 idle.smd
 
-### 第二步：用 Source Tools 重新导出
+**目的**：导出修正后的参考骨架，并让 idle.smd 的 `skeleton time 0` 与之一致。标准模型的 idle 就是 rest pose（无动画位移），所以直接复制骨架段即可。
 
-Blender SMD 导入器通常已正确还原局部旋转，因此 Blender 里的 rest pose 往往是正确的。**直接用 Source Tools 重新导出即可修正 raw 值**。
-
-导出 arms.smd（参考网格）：
+**为什么不用 Source Tools 导 idle 动画**：Source Tools 动画导出有 bug，会产生错误的旋转值（Finger01/02 值会翻倍）。文本复制骨架段是最可靠的方式。
 
 ```python
-import bpy
+out = r"<输出目录>"  # 如 E:\modelproject\models\v_model\c_arm\workbench\dom
+
+bpy.ops.object.mode_set(mode='OBJECT')
 scene = bpy.context.scene
 
-# 1. 清空旧 export_list，创建导出 collection
+# --- 导出 arms.smd ---
 scene.vs.export_list.clear()
-export_col = bpy.data.collections.new('arms_export')
-scene.collection.children.link(export_col)
+col = bpy.data.collections.new('export_tmp')
+scene.collection.children.link(col)
+for obj in [mesh, arm]:
+    for c in list(obj.users_collection): c.objects.unlink(obj)
+    col.objects.link(obj)
 
-# 2. 将 mesh 和 armature 移入 export collection
-for obj_name in ['arms', 'arms_skeleton']:
-    obj = bpy.data.objects[obj_name]
-    for col in list(obj.users_collection):
-        col.objects.unlink(obj)
-    export_col.objects.link(obj)
-
-# 3. 添加到 export_list
 item = scene.vs.export_list.add()
-item.name = "arms.smd"
-item.collection = export_col
+item.collection = col
 item.ob_type = 'COLLECTION'
-
-# 4. 设置导出路径和格式
-scene.vs.export_path = r"<输出目录>\\"
+arm.vs.subdir = ""  # 不导出动画
+scene.vs.export_path = out + "\\"
 scene.vs.export_format = 'SMD'
 scene.vs.smd_format = 'SOURCE'
-
-# 5. 导出（必须传 export_scene=True）
 bpy.ops.export_scene.smd(export_scene=True)
+
+# 覆盖原 arms.smd（先备份）
+arms_path = os.path.join(out, "yzallsb.smd")
+exported = os.path.join(out, "export_tmp.smd")
+if not os.path.exists(arms_path + ".backup"):
+    shutil.copy2(arms_path, arms_path + ".backup")
+shutil.copy2(exported, arms_path)
+os.remove(exported)
+
+# --- 更新 idle.smd（直接复制骨架段） ---
+with open(arms_path) as f:
+    arms_lines = f.readlines()
+skel_start = next(i for i,l in enumerate(arms_lines) if l.strip()=='skeleton')
+skel_end   = next(i for i,l in enumerate(arms_lines[skel_start:], skel_start) if l.strip()=='end') + 1
+
+idle_path = os.path.join(out, "v_arm_guerilla_anims", "Idle.smd")
+if not os.path.exists(idle_path + ".backup"):
+    shutil.copy2(idle_path, idle_path + ".backup")
+with open(idle_path) as f:
+    idle_lines = f.readlines()
+il_sk_start = next(i for i,l in enumerate(idle_lines) if l.strip()=='skeleton')
+il_sk_end   = next(i for i,l in enumerate(idle_lines[il_sk_start:], il_sk_start) if l.strip()=='end') + 1
+
+new_idle = idle_lines[:il_sk_start] + arms_lines[skel_start:skel_end] + idle_lines[il_sk_end:]
+with open(idle_path, 'w') as f:
+    f.writelines(new_idle)
+
+# --- 清理 ---
+for c in list(bpy.data.collections):
+    if c.name != 'Collection':
+        bpy.data.collections.remove(c)
+
+print("导出完成。arms.smd 和 idle.smd 已更新。")
 ```
 
-导出 idle.smd（动画）：
+**验证**：打开 yzallsb.smd 和 Idle.smd，确认 skeleton time 0 中 Finger0 行的旋转值一致：
+```
+# L_Finger0 应为: ... -1.222 -0.679 -0.789  （或你微调后的值）
+# R_Finger0 应为: ...  1.221  0.674 -0.794
+```
+
+### 步骤 3：更新 QC + 清理
+
+**目的**：QC 中的 `$definebone` 旋转值必须与 SMD 一致，否则 studiomdl 编译器会用旧值覆盖。同时删除标准模型不需要的 `reference` 序列。
+
+编辑 `<模型>.qc` 文件：
+
+- 修改 6 根拇指骨骼的 `$definebone` 行，**只改旋转值，位置不动**。QC 格式是 Crowbar ZYX（`rz ry rx` 度）：
+```
+  L_Finger0:  rz=-38.916  ry=-45.196  rx=-70.054
+  L_Finger01: rz= 0.000   ry= 13.093  rx=  0.000
+  L_Finger02: rz= 0.000   ry= 20.790  rx=  0.000
+  R_Finger0:  rz= 38.596  ry=-45.468  rx= 69.982
+  R_Finger01: rz= 0.000   ry= 13.095  rx=  0.000
+  R_Finger02: rz= 0.000   ry= 20.790  rx=  0.000
+```
+  **注意**：如果步骤 4 中微调了 Finger0 的 X 或 Z，QC 中的 `rx` 或 `rz` 也要对应更新。SMD 的 `rx` 对应 QC 的 `rx`（最后一位）。
+
+- 删除 `$sequence "reference" { ... }` 整个块
+- 删除 `v_arm_xxx_anims/reference.smd` 文件
+
+**为什么删 reference.smd**：标准 CS:CZ 模型（`v_arm_gign`）只有 idle 一个序列，没有 reference。这是 L4D2 来源的残留物，保留它可能导致引擎播放错误的起始帧。
+
+### 步骤 4：游戏内目视微调 Finger0 X/Z
+
+**目的**：标准值只是数学上正确，但因为 L4D2 模型 Hand 旋转不同，视觉上拇指位置可能偏移。需要在游戏内目视确认并微调。
+
+编译模型进游戏。观察拇指是否：
+- **翻转**（指甲朝内）→ Finger0 X 差太远，需要大幅调整
+- **不贴枪**（离枪太远）→ 调 Finger0 X（弯曲程度）
+- **扭转方向不对**（拇指指甲朝上/下而非朝外）→ 调 Finger0 Z
+
+| 参数 | 控制效果 | 微调范围 | 调整方向（L 侧） |
+|------|---------|---------|-----------------|
+| Finger0 X | 拇指弯曲程度 | -80° ~ -40° | 更负 = 拇指向手心弯 |
+| Finger0 Z | 拇指旋转方向 | -45° ~ -15° | 更接近 0 = 拇指向手心转 |
+
+规则：
+- 每次只调**一个轴**
+- 每次调整 **5-10°**
+- 调完后**回到步骤 1** 重新执行（改 `target` 字典中 Finger0 的 Euler 值）
+- R 侧的值取 L 侧的相反数（L=-50° → R=50°）
+
+**注意**：Finger01 和 Finger02 的标准值（13° 和 21°）通常不需要调。只调 Finger0。
+
+## 实测案例
+
+某 L4D2→CS:CZ 模型（guerilla 手臂）的完整修复过程：
+
+1. 原始 Finger0：`L=(103°, -29°, -6°)` `R=(-103°, 29°, -6°)`
+2. 先用标准值：`L=(-70°, -39°, -45°)` `R=(70°, 39°, -45°)`
+3. 游戏内发现拇指位置不对 → 调 Z：-45° → -30° → -25° → **-20°**
+4. 调 X：-70° → -80°（反了）→ **-50°**
+5. 最终值：`L=(-50°, -39°, -20°)` `R=(50°, 39°, -20°)`
 
 ```python
-# 先导入旧动画到骨架
-bpy.ops.import_scene.smd(filepath=r"<旧idle.smd路径>")
-
-# 设置 armature 的动画子目录
-armature = bpy.data.objects['arms_skeleton']
-armature.vs.subdir = "v_arm_gign_anims"
-
-# 用相同的 export_list 导出（会同时生成参考 .smd 和动画 .smd）
-bpy.ops.export_scene.smd(export_scene=True)
+# 最终 target 字典
+target = {
+    'ValveBiped.Bip01_L_Finger0':  Euler((math.radians(-50), math.radians(-39), math.radians(-20)), 'XYZ'),
+    'ValveBiped.Bip01_R_Finger0':  Euler((math.radians( 50), math.radians( 39), math.radians(-20)), 'XYZ'),
+    # Finger01/02 用标准值不变
+}
 ```
 
-### 第三步：手工验证导出结果
+## 常见陷阱
 
-导出后，检查新 SMD 文件中 `Finger0` 的旋转值：
+| 陷阱 | 表现 | 解决 |
+|------|------|------|
+| 改了 Hand 旋转 | 四指全歪，整个手型不对 | 回退，只改拇指 |
+| 改了骨骼位置 | mesh 撕裂，顶点飞掉 | 回退，用 Pose 保持原位置 |
+| 用 Source Tools 导 idle 动画 | Finger01/02 值翻倍，idle 变形 | 改用文本复制骨架段 |
+| QC `$definebone` 没更新 | studiomdl 用旧值覆盖 SMD | 同步更新 QC |
+| 忘了删 reference.smd | 引擎播放错误的起始帧 | 删文件 + 删 QC 中的 `$sequence "reference"` |
+| Finger0 调反了方向 | 拇指更歪了 | 另一个方向试，每次 5-10° |
+| SMD 和 QC 旋转格式混淆 | 值对但效果不对 | SMD: Euler XYZ 弧度, QC: Crowbar ZYX 度 |
 
-```
-# 在 skeleton time 0 段查找拇指骨骼行
-# L_Finger0 应为: 位置值 位置值 位置值  -1.2227 -0.6792 -0.7888
-# R_Finger0 应为: 位置值 位置值 位置值   1.2214  0.6736 -0.7936
-```
+## 关键参考
 
-### 第四步：覆盖并备份
-
-```python
-import shutil, os
-dst = "<目标arms.smd>"
-if not os.path.exists(dst + ".backup"):
-    shutil.copy2(dst, dst + ".backup")
-shutil.copy2(src, dst)
-```
-
-## 注意事项
-
-1. **不要直接文本编辑 SMD**：只改骨骼旋转不改顶点蒙皮会撕裂网格。必须通过 Blender 重新导出。
-2. **多出的骨骼不要急于删除**：L4D2/GMod 骨架可能包含 `thumbroot`、`zArmTwist`、`Sode*` 等额外骨骼。先保留，逐个验证是否需要。
-3. **HLMV 正常 ≠ 游戏正常**：HLMV 只播放模型自带的动画，是自洽的。游戏里如果引用了共享动画库（`$includemodel`），就会暴露 rest pose 差异。
-4. **同时更新 arms.smd 和 idle.smd**：参考骨架和动画必须一起重新导出，保证来源一致。
-5. **QC 的 `$definebone` 值不需修改**：如果只改 SMD 不改骨骼层级，QC 的骨骼定义保持不变。
+- 标准模型路径：`models/v_model/c_arm/standard/c_arms_cstrike_v2.smd` + `v_arm_gign.qc`
+- SMD 旋转 = 局部空间 Euler **XYZ**（弧度）
+- QC `$definebone` 旋转 = Crowbar **ZYX** 格式（度），`rx` 是最后一位，对应 SMD 的 `rx`
+- 修正公式：`pose = current_rest^(-1) @ target_rest`
+- 使用 `bpy.ops.pose.armature_apply()` — **Apply Pose as Rest Pose**，不是 Apply Visual Transform
