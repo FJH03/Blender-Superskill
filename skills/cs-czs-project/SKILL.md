@@ -72,3 +72,73 @@ description: CS:CZ Source project layout, directory conventions, asset pipeline 
 | `vphysics/` | 物理系统（约束、布娃娃、碰撞） |
 | `tier0/`、`tier1/`、`tier2/`、`tier3/` | 工具库（数学、线程、文件 IO、数据结构） |
 | `public/` | 引擎公共头文件和接口 |
+
+## Blender Source Tools 导出工作流（MCP 自动化）
+
+通过 Blender MCP 调用 `io_scene_valvesource`（Source Tools）导出 `.smd` 时，以下为已验证的坑和正确做法：
+
+### 关键发现
+
+1. **操作符不继承 `ExportHelper`**：`EXPORT_SCENE_OT_smd` 没有 `filepath` 参数。传入 `filepath=` 会报 `keyword "filepath" unrecognized`。导出路径通过场景属性控制。
+
+2. **必须传 `export_scene=True`**：不传此参数时，导出器走"选中对象"路径（`getSelectedExportables()`），可能找不到有效对象报 `Found no valid objects for export`。
+
+3. **导出路径是目录而非文件**：`scene.vs.export_path` 设置为目标**目录**（带尾部 `\\`），文件名由 export_list 中的 `name` 决定。
+
+4. **基于 Collection 而非 Selection**：导出器通过 `scene.vs.export_list` 中的 collection 条目决定导出哪些对象，不是通过 Blender 选中状态。
+
+5. **动画导出通过 armature 的 `vs.subdir`**：设置 `armature.vs.subdir` 为动画子目录名（如 `"v_arm_gign_anims"`），导出时会在此子目录下生成动画 `.smd`。
+
+### 完整导出模板
+
+```python
+import bpy
+scene = bpy.context.scene
+
+# 1. 清空并重建 export_list
+scene.vs.export_list.clear()
+col = bpy.data.collections.new('export_col')
+scene.collection.children.link(col)
+
+# 2. 将目标对象移入 collection（先从其原有 collection 中移除）
+for obj_name in ['mesh_obj', 'armature_obj']:
+    obj = bpy.data.objects[obj_name]
+    for c in list(obj.users_collection):
+        c.objects.unlink(obj)
+    col.objects.link(obj)
+
+# 3. 添加导出条目
+item = scene.vs.export_list.add()
+item.name = "output.smd"      # 输出文件名
+item.collection = col          # 用 .collection 而非 .item（只有 getter）
+item.ob_type = 'COLLECTION'
+
+# 4. 设置场景导出属性
+scene.vs.export_path = r"E:\target\dir\\"   # 目录，必须带尾部 \\
+scene.vs.export_format = 'SMD'
+scene.vs.smd_format = 'SOURCE'
+
+# 5. 如需导出动画，设置 armature 子目录
+armature = bpy.data.objects['armature_obj']
+armature.vs.subdir = "anims_subdir"
+
+# 6. 执行导出
+bpy.ops.export_scene.smd(export_scene=True)
+```
+
+### 常见错误速查
+
+| 错误 | 原因 | 解决 |
+|------|------|------|
+| `keyword "filepath" unrecognized` | Source Tools 不用 filepath 参数 | 用 `scene.vs.export_path` 代替 |
+| `Found no valid objects for export` | 未传 `export_scene=True`，或 export_list 为空 | 传 `export_scene=True` 并正确配置 export_list |
+| `property 'item' has no setter` | `export_list[].item` 是只读属性 | 用 `.collection` 设置集合引用 |
+| `Operator bpy.ops.object.select_all.poll() failed` | 不在 OBJECT 模式 | 先执行 `bpy.ops.object.mode_set(mode='OBJECT')` |
+| MCP 连接断开（`WinError 10038`） | 执行了 `read_factory_settings` 会卸载所有插件 | **严禁在 MCP 会话中调用** `read_factory_settings`；如需重置场景，逐个删除对象 |
+| 导入第二个 SMD 时骨骼合并 | SMD 导入器会把同名骨骼合并到已有骨架 | 这是正常行为；如需独立对比，先另存或导出骨架矩阵数值 |
+
+### 导入 SMD 注意事项
+
+- SMD 导入器会创建 `smd_bone_vis` 辅助网格，导出前应删除它以免干扰
+- 导入动画时，导入器自动匹配已有骨架的骨骼名（Validate 模式）
+- 导入后检查 `armature.animation_data.action` 确认动画已加载

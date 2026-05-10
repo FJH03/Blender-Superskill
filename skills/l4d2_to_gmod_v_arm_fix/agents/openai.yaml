@@ -1,0 +1,4 @@
+interface:
+  display_name: "L4D2/GMod V-Arm Thumb Fix"
+  short_description: "Fix thumb bone orientation when porting L4D2/GMod viewmodel arms to CS:CZ standard v_arm_gign skeleton."
+  default_prompt: "Use L4D2 to GMod V-Arm Fix to diagnose and correct thumb bone rest pose orientation in ported arm models."
