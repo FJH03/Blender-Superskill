@@ -107,6 +107,129 @@ description: CS:CZ Source project layout, directory conventions, asset pipeline 
 5. **附件分离**：不属于标准骨骼蒙皮的 mesh 部件拆为独立对象，在 QC 中用 `$bodygroup` 声明
 6. **编译验证**：导出、编译为 `.mdl`，游戏内验证
 
+## 玩家模型身体部件拆分
+
+将外部来源的玩家模型（只有一个整体 body.smd）拆分为 CS:CZ 标准的四部件结构（body / head / leftarm / rightarm）时，遵循以下流程。
+
+### 标准 bodygroup 结构
+
+参照 `models/cs_player/standard/ct_gign.qc`，玩家模型的 QC 应包含四个 bodygroup：
+
+```cpp
+$bodygroup "ct_gign"     { studio "body.smd"           }  // 躯干+腿
+$bodygroup "needhide"    { studio "head.smd"    blank  }  // 头部
+$bodygroup "leftarm"     { studio "leftarm.smd"  blank }  // 左臂
+$bodygroup "rightarm"    { studio "rightarm.smd" blank }  // 右臂
+```
+
+左右臂和头部 bodygroup 均带 `blank` 选项，支持游戏中独立隐藏/替换。
+
+### 骨骼组划分
+
+在 ValveBiped 标准骨骼体系中，按骨骼名即可精确划分四个部件：
+
+| 部件 | 顶点权重骨骼 |
+|------|-------------|
+| **左臂** | `ValveBiped.Bip01_L_Clavicle`、`L_UpperArm`、`L_Forearm`、`L_Hand`、`L_Finger*`（全部手指骨骼）、装饰骨如 `Sode*_L` |
+| **右臂** | `ValveBiped.Bip01_R_Clavicle`、`R_UpperArm`、`R_Forearm`、`R_Hand`、`R_Finger*`、装饰骨如 `Sode*_R` |
+| **头部** | `ValveBiped.Bip01_Head1`（含其子骨骼如 Hair*、TwinTail*） |
+| **躯干** | 其余所有骨骼（Pelvis、Spine*、Leg*、Neck1、weapon_bone*、Skirt* 等） |
+
+### Blender 拆分流程（MCP 自动化）
+
+**核心思路**：SMD 导入后只有一个 mesh 对象，按顶点权重所属骨骼组，用 BMesh 删除不属于该部件的顶点，生成三个独立 mesh。
+
+#### 步骤 1：导入 SMD 并分析
+
+```python
+import bpy
+bpy.ops.import_scene.smd(filepath=r"E:\path\to\body.smd")
+
+obj = bpy.data.objects['body']
+# 遍历顶点，按 vertex_groups 归类到 left_arm / right_arm / body
+```
+
+#### 步骤 2：用 BMesh 按顶点权重拆分
+
+```python
+import bmesh
+
+# 定义骨骼组集合
+left_arm_bones = {
+    'ValveBiped.Bip01_L_Clavicle', 'ValveBiped.Bip01_L_UpperArm',
+    'ValveBiped.Bip01_L_Forearm', 'ValveBiped.Bip01_L_Hand',
+    'ValveBiped.Bip01_L_Finger0', ..., 'Sode1_1_L', ...
+}
+right_arm_bones = {
+    'ValveBiped.Bip01_R_Clavicle', 'ValveBiped.Bip01_R_UpperArm',
+    'ValveBiped.Bip01_R_Forearm', 'ValveBiped.Bip01_R_Hand',
+    'ValveBiped.Bip01_R_Finger0', ..., 'Sode1_1_R', ...
+}
+
+# 遍历顶点判定归属
+vert_is_left = [any(obj.vertex_groups[g.group].name in left_arm_bones 
+                    for g in v.groups) for v in mesh.vertices]
+vert_is_right = [any(obj.vertex_groups[g.group].name in right_arm_bones 
+                     for g in v.groups) for v in mesh.vertices]
+
+# 复制 mesh 并用 BMesh 删除多余顶点
+leftarm_mesh = mesh.copy()
+bm = bmesh.new(); bm.from_mesh(leftarm_mesh)
+bmesh.ops.delete(bm, geom=[v for i, v in enumerate(bm.verts) 
+                           if not vert_is_left[i]], context='VERTS')
+bm.to_mesh(leftarm_mesh); bm.free()
+# 同理处理 rightarm_mesh、body_mesh（删去 vert_is_left | vert_is_right）
+```
+
+#### 步骤 3：创建对象并绑定骨架
+
+```python
+# 为每个 mesh 创建新对象，parent 到 armature
+for name, mesh_data in [('leftarm', leftarm_mesh), 
+                         ('rightarm', rightarm_mesh)]:
+    obj = bpy.data.objects.new(name, mesh_data)
+    scene.collection.objects.link(obj)
+    mod = obj.modifiers.new(name='Armature', type='ARMATURE')
+    mod.object = armature
+    obj.parent = armature
+```
+
+#### 步骤 4：逐一导出 SMD
+
+导出前先删除 `smd_bone_vis` 辅助网格。每个部件分别创建临时 collection 导出：
+
+```python
+scene.vs.export_path = r"E:\target\dir\\"
+scene.vs.export_format = 'SMD'
+scene.vs.smd_format = 'SOURCE'
+
+for obj_name, filename in [('leftarm', 'leftarm.smd'), 
+                            ('rightarm', 'rightarm.smd')]:
+    scene.vs.export_list.clear()
+    col = bpy.data.collections.new('tmp_export')
+    scene.collection.children.link(col)
+    col.objects.link(bpy.data.objects[obj_name])
+    col.objects.link(armature)  # 每个 SMD 都包含完整骨架
+    
+    item = scene.vs.export_list.add()
+    item.name = filename
+    item.collection = col
+    item.ob_type = 'COLLECTION'
+    
+    bpy.ops.export_scene.smd(export_scene=True)
+    bpy.data.collections.remove(col)
+```
+
+> **注意**：导出时不要在 collection 之间来回 unlink/link 对象，否则可能触发 `StructRNA of type Object has been removed` 错误。直接在已有 collection 的基础上 link 到临时 collection 即可，导出后删除临时 collection。
+
+### 验证检查清单
+
+- [ ] 各 SMD 骨骼节点数与原始 body.smd 一致（都含 115 个完整骨骼）
+- [ ] 左臂/右臂之间无顶点重叠（vert_is_left 与 vert_is_right 交集为空）
+- [ ] 部件交界处（肩膀-躯干、手臂-躯干）无缝隙
+- [ ] `$bonemerge` 列表与原始 QC 一致，覆盖所有骨骼
+- [ ] QC 中 head/leftarm/rightarm bodygroup 均含 `blank` 选项
+
 ## 引擎核心模块（game_src/ 下）
 
 | 模块 | 职责 |
